@@ -147,136 +147,106 @@ The gateway and Feign client will automatically distribute requests across both 
 
 
 
-
-Perfect — you’re looking at how to configure Resilience4j in your Spring Boot microservices. The YAML you wrote for circuitbreaker can be extended in a similar way for retry and timeout. Here’s a high-level example:
-
-📌 application.yml Example
-yaml
-resilience4j:
-  circuitbreaker:
-    instances:
-      slowService:
-        sliding-window-size: 10
-        minimum-number-of-calls: 5
-        failure-rate-threshold: 50
-        wait-duration-in-open-state: 10s
-        permitted-number-of-calls-in-half-open-state: 3
-
-  retry:
-    instances:
-      slowService:
-        max-attempts: 3
-        wait-duration: 2s
-        retry-exceptions:
-          - java.io.IOException
-          - java.util.concurrent.TimeoutException
-
-  timelimiter:
-    instances:
-      slowService:
-        timeout-duration: 3s
-        cancel-running-future: true
-🔑 What Each Section Does
-CircuitBreaker
-
-Monitors calls to slowService.
-
-Opens the circuit if failure rate > 50% in a sliding window of 10 calls.
-
-Stays open for 10s, then moves to half-open to test recovery.
-
-Retry
-
-Retries failed calls to slowService up to 3 times.
-
-Waits 2s between attempts.
-
-Only retries on specific exceptions (like IOException).
-
-TimeLimiter
-
-Limits execution time of slowService calls to 3s.
-
-Cancels the future if timeout is exceeded.
-
-⚙️ Usage in Code
-You typically annotate methods with @CircuitBreaker, @Retry, or @TimeLimiter:
-
-java
-@Service
-public class OrderService {
-
-    @CircuitBreaker(name = "slowService", fallbackMethod = "fallbackOrder")
-    @Retry(name = "slowService")
-    @TimeLimiter(name = "slowService")
-    public CompletableFuture<String> placeOrder(String productId) {
-        return CompletableFuture.supplyAsync(() -> {
-            // call to product service
-            return "Order placed for product " + productId;
-        });
-    }
-
-    public CompletableFuture<String> fallbackOrder(String productId, Throwable t) {
-        return CompletableFuture.completedFuture("Fallback: Product service unavailable for " + productId);
-    }
-}
-👉 This way, Resilience4j gives you fault tolerance at three levels:
-
-Circuit breaker (stop hammering a failing service),
-
-Retry (try again on transient errors),
-
-Timeout (don’t hang forever).
-
-Would you like me to also show how to combine these with Feign clients in your Service A → Service B calls? That’s a common pattern in microservices.
-
-if using retstemple insated of feign cllient which annotation to yse name=servcie=b in ordersErvce
-If you switch from FeignClient to using RestTemplate, you don’t use @FeignClient(name="service-b") anymore. Instead, you rely on Spring Cloud LoadBalancer with @LoadBalanced to resolve service names (like service-b) into actual instances registered in Eureka.
-
-🔑 Key Annotation
-java
-@Bean
-@LoadBalanced   // <-- This is the critical annotation
-public RestTemplate restTemplate() {
-    return new RestTemplate();
-}
-@LoadBalanced tells Spring to intercept calls made with RestTemplate and resolve the service name (http://service-b/...) via Eureka + LoadBalancer.
-
-Without it, RestTemplate would expect a fixed hostname/IP and wouldn’t know how to discover services dynamically.
-
-📌 Example in Service A (Order Service)
+🟦 Eureka Server
 java
 @SpringBootApplication
+@EnableEurekaServer
+public class EurekaServerApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(EurekaServerApplication.class, args);
+    }
+}
+🟩 API Gateway
+java
+@SpringBootApplication
+public class ApiGatewayApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ApiGatewayApplication.class, args);
+    }
+}
+application.yml
+
+yaml
+spring:
+  application:
+    name: api-gateway
+  cloud:
+    gateway:
+      routes:
+        - id: service-a
+          uri: lb://service-a
+          predicates:
+            - Path=/orders/**
+        - id: service-b
+          uri: lb://service-b
+          predicates:
+            - Path=/products/**
+🟧 Service A (Order Service)
+java
+@SpringBootApplication
+@EnableFeignClients
 public class ServiceAApplication {
     public static void main(String[] args) {
         SpringApplication.run(ServiceAApplication.class, args);
     }
 }
 
+@FeignClient(name = "service-b")
+public interface ProductClient {
+    @GetMapping("/products/{id}")
+    Product getProduct(@PathVariable("id") String id);
+}
+
 @RestController
 @RequestMapping("/orders")
 public class OrderController {
+    private final ProductClient productClient;
 
-    private final RestTemplate restTemplate;
-
-    public OrderController(RestTemplate restTemplate) {
-        this.restTemplate = restTemplate;
+    public OrderController(ProductClient productClient) {
+        this.productClient = productClient;
     }
 
     @GetMapping("/{id}")
     public String getOrder(@PathVariable String id) {
-        // Call Service B using service name, not hardcoded URL
-        Product product = restTemplate.getForObject(
-            "http://service-b/products/" + id, Product.class);
-
+        Product product = productClient.getProduct(id);
         return "Order for product: " + product.getName();
     }
 }
-⚙️ Flow
-Service A calls http://service-b/products/{id} via RestTemplate.
+🟥 Service B (Product Service)
+java
+@SpringBootApplication
+public class ServiceBApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ServiceBApplication.class, args);
+    }
+}
 
-@LoadBalanced RestTemplate consults Eureka to find all instances of service-b.
+@RestController
+@RequestMapping("/products")
+public class ProductController {
+    @GetMapping("/{id}")
+    public Product getProduct(@PathVariable String id) {
+        return new Product(id, "Sample Product " + id);
+    }
+}
 
-Spring Cloud LoadBalancer picks one instance.
+class Product {
+    private String id;
+    private String name;
 
-Request routed → response returned.
+    // constructor, getters, setters
+}
+🔄 Flow Recap
+Client calls http://localhost:8080/orders/123.
+
+Gateway routes to Service A.
+
+Service A uses Feign to call Service B.
+
+Service B returns product info.
+
+Service A responds with order details.
+
+This is the minimal skeleton. You’d add resilience (timeouts, retries, circuit breakers), centralized config, and observability (logging, tracing) as the next layer.
+
+Would you like me to extend this into a sequence diagram in code (PlantUML) so you can visualize the request flow end-to-end?
