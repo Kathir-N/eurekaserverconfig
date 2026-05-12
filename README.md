@@ -147,8 +147,38 @@ The gateway and Feign client will automatically distribute requests across both 
 
 
 
-🟦 Eureka Server
-java
+# Spring Boot Microservices Architecture
+
+A microservices setup using **Eureka Server**, **API Gateway**, **Feign Client**, and two services communicating with each other.
+
+---
+
+## Architecture Overview
+
+```
+Client
+  │
+  ▼
+API Gateway (port 8080)
+  │
+  ├──► Service A - Order Service (port 8081)
+  │         │
+  │         └──► Service B via Feign Client
+  │
+  └──► Service B - Product Service (port 8082)
+  
+All services register with → Eureka Server (port 8761)
+```
+
+---
+
+## Services
+
+### 🟩 Eureka Server
+
+Service registry — all microservices register here so they can discover each other.
+
+```java
 @SpringBootApplication
 @EnableEurekaServer
 public class EurekaServerApplication {
@@ -156,17 +186,49 @@ public class EurekaServerApplication {
         SpringApplication.run(EurekaServerApplication.class, args);
     }
 }
-🟩 API Gateway
-java
+```
+
+**`application.yml`**
+```yaml
+server:
+  port: 8761
+
+spring:
+  application:
+    name: eureka-server
+
+eureka:
+  client:
+    register-with-eureka: false   # don't register itself
+    fetch-registry: false         # don't fetch registry from another server
+  server:
+    wait-time-in-ms-when-sync-empty: 0   # faster startup in dev
+  instance:
+    hostname: localhost
+```
+
+Dashboard available at: `http://localhost:8761`
+
+---
+
+### 🟩 API Gateway
+
+Single entry point for all client requests. Routes traffic to the correct service using path-based routing.
+
+```java
 @SpringBootApplication
 public class ApiGatewayApplication {
     public static void main(String[] args) {
         SpringApplication.run(ApiGatewayApplication.class, args);
     }
 }
-application.yml
+```
 
-yaml
+**`application.yml`**
+```yaml
+server:
+  port: 8080
+
 spring:
   application:
     name: api-gateway
@@ -174,15 +236,39 @@ spring:
     gateway:
       routes:
         - id: service-a
-          uri: lb://service-a
+          uri: lb://service-a          # lb = load balanced via Eureka
           predicates:
             - Path=/orders/**
+          filters:
+            - StripPrefix=0            # keeps /orders/** as-is
+
         - id: service-b
           uri: lb://service-b
           predicates:
             - Path=/products/**
-🟧 Service A (Order Service)
-java
+          filters:
+            - StripPrefix=0
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+
+logging:
+  level:
+    org.springframework.cloud.gateway: DEBUG  # helpful during development
+```
+
+---
+
+### 🟧 Service A — Order Service
+
+Handles order requests. Uses **Feign Client** to call Service B internally.
+
+**Main Class**
+```java
 @SpringBootApplication
 @EnableFeignClients
 public class ServiceAApplication {
@@ -190,16 +276,50 @@ public class ServiceAApplication {
         SpringApplication.run(ServiceAApplication.class, args);
     }
 }
+```
 
+**`application.yml`**
+```yaml
+server:
+  port: 8081
+
+spring:
+  application:
+    name: service-a                  # must match lb://service-a in gateway
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+
+# Feign client timeout settings
+feign:
+  client:
+    config:
+      default:
+        connect-timeout: 5000
+        read-timeout: 5000
+  circuitbreaker:
+    enabled: true                    # enable resilience4j fallback (optional)
+```
+
+**Feign Client** (calls Service B)
+```java
 @FeignClient(name = "service-b")
 public interface ProductClient {
     @GetMapping("/products/{id}")
     Product getProduct(@PathVariable("id") String id);
 }
+```
 
+**Controller**
+```java
 @RestController
 @RequestMapping("/orders")
 public class OrderController {
+
     private final ProductClient productClient;
 
     public OrderController(ProductClient productClient) {
@@ -212,41 +332,162 @@ public class OrderController {
         return "Order for product: " + product.getName();
     }
 }
-🟥 Service B (Product Service)
-java
+```
+
+---
+
+### 🟥 Service B — Product Service
+
+Handles product data. Called directly by clients via the gateway, or internally by Service A via Feign.
+
+**`application.yml`**
+```yaml
+server:
+  port: 8082
+
+spring:
+  application:
+    name: service-b                  # must match lb://service-b in gateway
+  datasource:
+    url: jdbc:h2:mem:productdb       # H2 in-memory DB (swap for MySQL/Postgres in prod)
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  h2:
+    console:
+      enabled: true                  # access at http://localhost:8082/h2-console
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: true
+
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+  instance:
+    prefer-ip-address: true
+```
+
+**Main Class**
+```java
 @SpringBootApplication
 public class ServiceBApplication {
     public static void main(String[] args) {
         SpringApplication.run(ServiceBApplication.class, args);
     }
 }
+```
 
+**Controller**
+```java
 @RestController
 @RequestMapping("/products")
 public class ProductController {
+
     @GetMapping("/{id}")
     public Product getProduct(@PathVariable String id) {
         return new Product(id, "Sample Product " + id);
     }
 }
+```
 
+**Model**
+```java
 class Product {
     private String id;
     private String name;
 
-    // constructor, getters, setters
+    public Product(String id, String name) {
+        this.id = id;
+        this.name = name;
+    }
+
+    // getters and setters
+    public String getId()   { return id; }
+    public String getName() { return name; }
 }
-🔄 Flow Recap
-Client calls http://localhost:8080/orders/123.
+```
 
-Gateway routes to Service A.
+---
 
-Service A uses Feign to call Service B.
+## 🔄 Request Flow
 
-Service B returns product info.
+```
+1. Client calls → GET http://localhost:8080/orders/123
 
-Service A responds with order details.
+2. API Gateway
+   └── matches Path=/orders/**
+   └── routes to → Service A (lb://service-a)
 
-This is the minimal skeleton. You’d add resilience (timeouts, retries, circuit breakers), centralized config, and observability (logging, tracing) as the next layer.
+3. Service A - OrderController
+   └── calls ProductClient.getProduct("123")
 
-Would you like me to extend this into a sequence diagram in code (PlantUML) so you can visualize the request flow end-to-end?
+4. Feign Client (Service A → Service B)
+   └── resolves "service-b" from Eureka
+   └── calls → GET http://service-b/products/123
+
+5. Service B - ProductController
+   └── returns Product("123", "Sample Product 123")
+
+6. Service A
+   └── returns "Order for product: Sample Product 123"
+
+7. Response flows back to Client ✅
+```
+
+---
+
+## Dependencies
+
+Add these to each service's `pom.xml`:
+
+```xml
+<!-- Eureka Client (all services except Eureka Server) -->
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-netflix-eureka-client</artifactId>
+</dependency>
+
+<!-- API Gateway -->
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-gateway</artifactId>
+</dependency>
+
+<!-- Feign Client (Service A) -->
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-openfeign</artifactId>
+</dependency>
+
+<!-- Eureka Server -->
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-netflix-eureka-server</artifactId>
+</dependency>
+```
+
+---
+
+## Startup Order
+
+1. **Eureka Server** — must start first
+2. **Service B** (Product Service)
+3. **Service A** (Order Service)
+4. **API Gateway**
+
+---
+
+## Quick Test
+
+```bash
+# Get an order (triggers full flow)
+curl http://localhost:8080/orders/123
+
+# Expected response
+Order for product: Sample Product 123
+
+# Hit Service B directly via gateway
+curl http://localhost:8080/products/123
+```
